@@ -62,11 +62,10 @@ def main():
     """主函数"""
     try:
         # 获取环境变量
-        pages = int(os.getenv('PAGES', '3'))
-        max_articles = int(os.getenv('MAX_ARTICLES', '50'))
+        hours = int(os.getenv('HOURS', '24'))
         
         logging.info("=== TechCrunch 自动化爬虫启动 ===")
-        logging.info(f"配置: 页数={pages}, 最大文章数={max_articles}")
+        logging.info(f"配置: 时间限制={hours}小时")
         
         # 加载配置
         config = load_config()
@@ -82,21 +81,21 @@ def main():
             logging.error("Supabase客户端初始化失败")
             sys.exit(1)
         
-        # 爬取文章（启用24小时早期停止）
-        logging.info(f"开始爬取 {pages} 页文章（启用24小时早期停止）...")
+        # 爬取文章（基于时间限制，无页数和文章数限制）
+        logging.info(f"开始爬取文章（时间限制: {hours}小时）...")
         articles = crawler.crawl_articles(
-            pages=pages,
+            pages=999,  # 设置足够大的页数
             extract_content=True,
-            max_articles=max_articles,
+            max_articles=None,  # 不限制文章数
             max_workers=3,
-            early_stop_hours=24  # 24小时早期停止
+            early_stop_hours=hours  # 使用环境变量的时间限制
         )
         
         if not articles:
             logging.warning("没有爬取到任何文章")
             return
         
-        logging.info(f"成功爬取 {len(articles)} 篇文章（已通过早期停止过滤）")
+        logging.info(f"成功爬取 {len(articles)} 篇文章（{hours}小时内）")
         
         # 只上传有内容的文章
         articles_with_content = [a for a in articles if a.get('content') and len(a.get('content', '')) > 100]

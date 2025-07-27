@@ -8,15 +8,10 @@ on:
   # 允许手动触发
   workflow_dispatch:
     inputs:
-      pages:
-        description: '爬取页数'
+      hours:
+        description: '时间限制（小时）'
         required: false
-        default: '3'
-        type: string
-      max_articles:
-        description: '最大文章数限制'
-        required: false
-        default: '50'
+        default: '24'
         type: string
 
 env:
@@ -59,8 +54,7 @@ jobs:
       run: |
         python automated_crawler.py
       env:
-        PAGES: ${{ github.event.inputs.pages || '3' }}
-        MAX_ARTICLES: ${{ github.event.inputs.max_articles || '50' }}
+        HOURS: ${{ github.event.inputs.hours || '24' }}
     
     - name: Upload logs (on failure)
       if: failure()
