@@ -56,6 +56,50 @@ class TechCrunchCrawler:
             logging.error(f"Supabase初始化失败: {e}")
             self.supabase_client = None
     
+    def _is_text_similar(self, text1: str, text2: str, threshold: float = 0.85) -> bool:
+        """检查两段文本是否相似（基于字符级相似度）"""
+        if not text1 or not text2:
+            return False
+        
+        # 如果文本完全相同
+        if text1 == text2:
+            return True
+        
+        # 如果长度差异太大，认为不相似
+        len_diff = abs(len(text1) - len(text2))
+        max_len = max(len(text1), len(text2))
+        if max_len > 0 and len_diff / max_len > 0.3:
+            return False
+        
+        # 使用字符级别的n-gram计算相似度
+        def get_char_ngrams(text, n=3):
+            """获取字符n-gram集合"""
+            if len(text) < n:
+                return {text}
+            return set(text[i:i+n] for i in range(len(text)-n+1))
+        
+        # 使用3-gram计算相似度
+        ngrams1 = get_char_ngrams(text1, 3)
+        ngrams2 = get_char_ngrams(text2, 3)
+        
+        if not ngrams1 or not ngrams2:
+            return False
+        
+        # 计算Jaccard相似度
+        intersection = len(ngrams1.intersection(ngrams2))
+        union = len(ngrams1.union(ngrams2))
+        
+        if union == 0:
+            return False
+        
+        similarity = intersection / union
+        
+        # 记录相似度用于调试
+        if similarity > 0.7:  # 只记录较高相似度的比较
+            logging.debug(f"文本相似度: {similarity:.3f} (阈值: {threshold})")
+        
+        return similarity >= threshold
+    
     def upload_to_supabase(self, articles: List[Dict] = None) -> bool:
         """将文章上传到Supabase数据库"""
         if not self.supabase_client:
@@ -103,17 +147,68 @@ class TechCrunchCrawler:
             # 批量上传 - 先检查重复文章
             table_name = self.supabase_config.get('table_name', 'news_items')
             
-            # 获取现有文章URLs
+            # 获取现有文章的URL和内容前缀进行去重
             existing_urls = set()
+            existing_content_prefixes = set()
             try:
-                existing_result = self.supabase_client.table(table_name).select("url").execute()
+                existing_result = self.supabase_client.table(table_name).select("url, content").execute()
                 existing_urls = {item['url'] for item in existing_result.data}
+                
+                # 提取现有文章内容的前300个字符用于比较
+                for item in existing_result.data:
+                    content = item.get('content', '')
+                    if content:
+                        # 清理并标准化前300个字符
+                        prefix = content[:300].lower().strip()
+                        # 移除多余空白字符
+                        prefix = ' '.join(prefix.split())
+                        if len(prefix) > 50:  # 只保存足够长的前缀
+                            existing_content_prefixes.add(prefix)
+                
                 logging.info(f"数据库中已有 {len(existing_urls)} 篇文章")
+                logging.info(f"收集了 {len(existing_content_prefixes)} 个内容前缀用于去重")
             except Exception as e:
                 logging.warning(f"无法获取现有文章列表: {e}")
             
-            # 过滤重复文章
-            new_articles = [article for article in upload_data if article['url'] not in existing_urls]
+            # 智能过滤重复文章
+            new_articles = []
+            duplicate_count = 0
+            
+            for article in upload_data:
+                # 1. URL完全匹配检查
+                if article['url'] in existing_urls:
+                    duplicate_count += 1
+                    logging.debug(f"跳过URL重复文章: {article.get('title', 'N/A')}")
+                    continue
+                
+                # 2. 内容相似性检查
+                content = article.get('content', '')
+                if content:
+                    # 获取当前文章的前300个字符
+                    current_prefix = content[:300].lower().strip()
+                    current_prefix = ' '.join(current_prefix.split())
+                    
+                    if len(current_prefix) > 50:
+                        # 检查是否与现有内容前缀相似
+                        is_duplicate = False
+                        for existing_prefix in existing_content_prefixes:
+                            # 计算相似度
+                            if self._is_text_similar(current_prefix, existing_prefix):
+                                duplicate_count += 1
+                                logging.info(f"发现内容相似的重复文章: {article.get('title', 'N/A')}")
+                                is_duplicate = True
+                                break
+                        
+                        if is_duplicate:
+                            continue
+                        
+                        # 添加到现有前缀集合，防止本批次内重复
+                        existing_content_prefixes.add(current_prefix)
+                
+                new_articles.append(article)
+            
+            if duplicate_count > 0:
+                logging.info(f"过滤了 {duplicate_count} 篇重复文章")
             
             if not new_articles:
                 logging.info("没有新文章需要上传")
