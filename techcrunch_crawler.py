@@ -170,18 +170,35 @@ class TechCrunchCrawler:
             except Exception as e:
                 logging.warning(f"无法获取现有文章列表: {e}")
             
+            # 获取现有文章的标题进行精确去重
+            existing_titles = set()
+            try:
+                title_result = self.supabase_client.table(table_name).select("title").execute()
+                existing_titles = {item['title'] for item in title_result.data}
+                logging.debug(f"获取到 {len(existing_titles)} 个现有标题用于去重")
+            except Exception as e:
+                logging.warning(f"无法获取现有标题列表: {e}")
+            
             # 智能过滤重复文章
             new_articles = []
             duplicate_count = 0
             
             for article in upload_data:
-                # 1. URL完全匹配检查
+                article_title = article.get('title', '')
+                
+                # 1. 标题完全匹配检查（最可靠）
+                if article_title and article_title in existing_titles:
+                    duplicate_count += 1
+                    logging.debug(f"跳过标题重复文章: {article_title}")
+                    continue
+                
+                # 2. URL完全匹配检查
                 if article['url'] in existing_urls:
                     duplicate_count += 1
                     logging.debug(f"跳过URL重复文章: {article.get('title', 'N/A')}")
                     continue
                 
-                # 2. 内容相似性检查
+                # 3. 内容相似性检查
                 content = article.get('content', '')
                 if content:
                     # 获取当前文章的前300个字符
@@ -195,7 +212,7 @@ class TechCrunchCrawler:
                             # 计算相似度
                             if self._is_text_similar(current_prefix, existing_prefix):
                                 duplicate_count += 1
-                                logging.info(f"发现内容相似的重复文章: {article.get('title', 'N/A')}")
+                                logging.debug(f"发现内容相似的重复文章: {article.get('title', 'N/A')}")
                                 is_duplicate = True
                                 break
                         
@@ -204,6 +221,10 @@ class TechCrunchCrawler:
                         
                         # 添加到现有前缀集合，防止本批次内重复
                         existing_content_prefixes.add(current_prefix)
+                
+                # 添加标题到集合，防止本批次内重复
+                if article_title:
+                    existing_titles.add(article_title)
                 
                 new_articles.append(article)
             
@@ -216,11 +237,69 @@ class TechCrunchCrawler:
             
             logging.info(f"过滤后有 {len(new_articles)} 篇新文章需要上传")
             
-            # 上传新文章
-            result = self.supabase_client.table(table_name).insert(new_articles).execute()
+            # 使用单条插入策略避免批量插入时的唯一约束冲突
+            successful_uploads = 0
+            failed_uploads = 0
             
-            logging.info(f"成功上传 {len(new_articles)} 篇新文章到Supabase")
-            return True
+            for i, article in enumerate(new_articles, 1):
+                max_retries = 3
+                retry_count = 0
+                uploaded = False
+                
+                while retry_count < max_retries and not uploaded:
+                    try:
+                        # 尝试单条插入，优先使用 insert，失败时自动降级到 upsert
+                        if retry_count == 0:
+                            # 第一次尝试：普通插入
+                            result = self.supabase_client.table(table_name).insert(article).execute()
+                        else:
+                            # 重试时使用 upsert 避免冲突
+                            result = self.supabase_client.table(table_name).upsert(
+                                article,
+                                on_conflict='title'
+                            ).execute()
+                        
+                        successful_uploads += 1
+                        uploaded = True
+                        if retry_count > 0:
+                            logging.info(f"重试成功上传文章: {article.get('title', 'N/A')}")
+                        
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        retry_count += 1
+                        
+                        if 'duplicate key' in error_msg or '23505' in error_msg:
+                            if retry_count < max_retries:
+                                logging.debug(f"检测到重复，尝试upsert: {article.get('title', 'N/A')}")
+                                time.sleep(0.5)  # 短暂延迟后重试
+                                continue
+                            else:
+                                logging.debug(f"跳过重复文章: {article.get('title', 'N/A')}")
+                                break
+                        elif 'network' in error_msg or 'timeout' in error_msg or 'connection' in error_msg:
+                            if retry_count < max_retries:
+                                logging.warning(f"网络错误，{retry_count}/{max_retries} 次重试: {article.get('title', 'N/A')}")
+                                time.sleep(1 * retry_count)  # 递增延迟
+                                continue
+                            else:
+                                logging.error(f"网络错误多次重试失败: {article.get('title', 'N/A')}")
+                                break
+                        else:
+                            logging.warning(f"上传文章失败 ({retry_count}/{max_retries}): {article.get('title', 'N/A')}, 错误: {e}")
+                            if retry_count < max_retries:
+                                time.sleep(0.5 * retry_count)
+                                continue
+                            break
+                
+                if not uploaded:
+                    failed_uploads += 1
+                
+                # 显示进度
+                if i % 5 == 0 or i == len(new_articles):
+                    logging.info(f"上传进度: {i}/{len(new_articles)}, 成功: {successful_uploads}, 失败: {failed_uploads}")
+            
+            logging.info(f"上传结果: 成功 {successful_uploads} 篇，跳过/失败 {failed_uploads} 篇")
+            return successful_uploads > 0
             
         except Exception as e:
             logging.error(f"上传到Supabase失败: {e}")
