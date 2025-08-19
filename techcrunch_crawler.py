@@ -240,6 +240,7 @@ class TechCrunchCrawler:
             # 使用单条插入策略避免批量插入时的唯一约束冲突
             successful_uploads = 0
             failed_uploads = 0
+            skipped_duplicates = 0
             
             for i, article in enumerate(new_articles, 1):
                 max_retries = 3
@@ -248,16 +249,8 @@ class TechCrunchCrawler:
                 
                 while retry_count < max_retries and not uploaded:
                     try:
-                        # 尝试单条插入，优先使用 insert，失败时自动降级到 upsert
-                        if retry_count == 0:
-                            # 第一次尝试：普通插入
-                            result = self.supabase_client.table(table_name).insert(article).execute()
-                        else:
-                            # 重试时使用 upsert 避免冲突
-                            result = self.supabase_client.table(table_name).upsert(
-                                article,
-                                on_conflict='title'
-                            ).execute()
+                        # 直接使用普通插入，遇到重复则跳过
+                        result = self.supabase_client.table(table_name).insert(article).execute()
                         
                         successful_uploads += 1
                         uploaded = True
@@ -268,14 +261,11 @@ class TechCrunchCrawler:
                         error_msg = str(e).lower()
                         retry_count += 1
                         
-                        if 'duplicate key' in error_msg or '23505' in error_msg:
-                            if retry_count < max_retries:
-                                logging.debug(f"检测到重复，尝试upsert: {article.get('title', 'N/A')}")
-                                time.sleep(0.5)  # 短暂延迟后重试
-                                continue
-                            else:
-                                logging.debug(f"跳过重复文章: {article.get('title', 'N/A')}")
-                                break
+                        if 'duplicate key' in error_msg or '23505' in error_msg or '409' in error_msg:
+                            logging.debug(f"跳过重复文章: {article.get('title', 'N/A')}")
+                            skipped_duplicates += 1
+                            uploaded = True  # 标记为已处理，避免计入失败
+                            break
                         elif 'network' in error_msg or 'timeout' in error_msg or 'connection' in error_msg:
                             if retry_count < max_retries:
                                 logging.warning(f"网络错误，{retry_count}/{max_retries} 次重试: {article.get('title', 'N/A')}")
@@ -296,10 +286,10 @@ class TechCrunchCrawler:
                 
                 # 显示进度
                 if i % 5 == 0 or i == len(new_articles):
-                    logging.info(f"上传进度: {i}/{len(new_articles)}, 成功: {successful_uploads}, 失败: {failed_uploads}")
+                    logging.info(f"上传进度: {i}/{len(new_articles)}, 成功: {successful_uploads}, 跳过重复: {skipped_duplicates}, 失败: {failed_uploads}")
             
-            logging.info(f"上传结果: 成功 {successful_uploads} 篇，跳过/失败 {failed_uploads} 篇")
-            return successful_uploads > 0
+            logging.info(f"上传结果: 成功 {successful_uploads} 篇，跳过重复 {skipped_duplicates} 篇，失败 {failed_uploads} 篇")
+            return successful_uploads > 0 or skipped_duplicates > 0
             
         except Exception as e:
             logging.error(f"上传到Supabase失败: {e}")
